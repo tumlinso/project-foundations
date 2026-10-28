@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from project_source import CppContextCompilerProvider, Repository, RetrievalTarget, SourceIndex
 
@@ -106,6 +107,19 @@ class SourceTests(unittest.TestCase):
             self.assertFalse(denied_only.complete)
             self.assertEqual(denied_only.sections,{})
             self.assertEqual(denied_only.omissions[0]["reason"],"path_denied")
+            with patch.object(restricted,"update",side_effect=AssertionError("denied-only context must not index")):
+                no_index=restricted.context([".env"],include=("implementation",),budget_bytes=1000)
+            self.assertEqual(no_index.omissions[0]["reason"],"path_denied")
+
+            local=SourceIndex(Repository(root,"fixture",Path(td)/"no-index-state",deny_patterns=(".env", "hidden.py")))
+            missing=RetrievalTarget("path",target="missing.py")
+            with patch.object(local,"update",side_effect=AssertionError("explicit path context must not index")):
+                missing_only=local.context([missing],include=("implementation",),budget_bytes=1000)
+                mixed_missing=local.context(["public.py",missing],include=("implementation",),budget_bytes=1000)
+            self.assertEqual(missing_only.omissions[0]["reason"],"path_missing")
+            self.assertTrue(any(item.path=="public.py" for item in mixed_missing.sections["implementation"]))
+            self.assertTrue(any(isinstance(item,dict) and item.get("reason")=="path_missing"
+                for item in mixed_missing.omissions))
 
     def test_cpp_provider_respects_consumer_deny_policy(self):
         with tempfile.TemporaryDirectory() as td:

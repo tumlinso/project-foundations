@@ -722,9 +722,25 @@ class SourceIndex:
             if record.get("repository_id") not in {None,self.repository.repository_id}:
                 raise ValueError(f"target belongs to repository {record['repository_id']!r}, not {self.repository.repository_id!r}")
         wants_index=any(section in requested for section in ("callers","references","tests"))
-        has_symbol=any(record["kind"]=="symbol" or not (self.repository.root/str(record.get("path") or record["target"])).is_file()
-                       for record in original)
-        if wants_index or has_symbol:
+        permitted = [(index, record) for index, record in enumerate(original) if index not in denied_targets]
+        has_symbol = False
+        for _index, record in permitted:
+            if record.get("kind") == "symbol":
+                has_symbol = True
+                break
+            if record.get("path") or record.get("kind") in {"path", "file"}:
+                continue
+            candidate = record.get("target", "")
+            try:
+                _, rel = self._path(candidate)
+                if not (self.repository.root / rel).is_file() and not self.repository.revision:
+                    has_symbol = True
+                    break
+            except ValueError:
+                has_symbol = True
+                break
+        needs_index = bool(permitted) and (wants_index or has_symbol)
+        if needs_index:
             self.update()
             with self._connect() as db:
                 generation_rows=db.execute("SELECT path,sha256 FROM files ORDER BY path").fetchall()
@@ -787,12 +803,21 @@ class SourceIndex:
                     symbol_definition=definitions[0]; path_candidate=symbol_definition["path"]
                 elif len(definitions)>1: omissions.append(f"{target}: ambiguous symbol target"); continue
                 else: omissions.append(f"{target}: target not found as a path or indexed symbol"); continue
-            if target_record.get("line_start") is not None or target_record.get("line_end") is not None:
-                source=self.read(path_candidate,target_record.get("line_start"),target_record.get("line_end"),remaining)
-            elif symbol_definition:
-                source=self.read(path_candidate,symbol_definition["line"],symbol_definition["end_line"],remaining)
-            else:
-                source=self.read(path_candidate,max_bytes=remaining)
+            try:
+                if target_record.get("line_start") is not None or target_record.get("line_end") is not None:
+                    source=self.read(path_candidate,target_record.get("line_start"),target_record.get("line_end"),remaining)
+                elif symbol_definition:
+                    source=self.read(path_candidate,symbol_definition["line"],symbol_definition["end_line"],remaining)
+                else:
+                    source=self.read(path_candidate,max_bytes=remaining)
+            except FileNotFoundError:
+                omissions.append({"reason": "path_missing", "target": target, "path": path_candidate})
+                completed_targets += 1
+                continue
+            except PermissionError:
+                omissions.append({"reason": "source_inaccessible", "target": target, "path": path_candidate})
+                completed_targets += 1
+                continue
             if source.cursor:
                 continuations.append({"target":target,"section":"implementation","path":path_candidate,
                     "source":asdict(source.source),"cursor":source.cursor})
