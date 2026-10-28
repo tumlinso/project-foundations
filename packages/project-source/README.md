@@ -13,6 +13,12 @@ packet = index.context(["src/main.py"], budget_bytes=12000)
 print(packet.sections, packet.complete, packet.cursor)
 ```
 
+Consumers may pass `deny_patterns=(".env", "private/**")` on `Repository` to
+apply their existing path policy uniformly to discovery, indexing, direct and
+historical reads, structural providers, graph traversal, and context assembly.
+The patterns use the same path matching rules as Project Control. Cached rows
+from an older or less restrictive consumer remain filtered at query time.
+
 Python definitions, imports and locally resolvable calls are structural
 observations. Unresolved or ambiguous calls remain labeled as such. Other
 languages have file and lexical search unless a structural provider is added.

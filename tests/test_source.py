@@ -62,6 +62,58 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(index.tree()["paths"],[".gitignore","main.py"])
             self.assertEqual(index.update()["changed"],2)
 
+    def test_consumer_deny_policy_gates_cached_discovery_reads_and_structure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)/"repo"; root.mkdir()
+            (root/".env").write_text("API_TOKEN=tracked-secret\n")
+            (root/"hidden.py").write_text("def hidden(): return 'private'\n")
+            (root/"public.py").write_text("def public(): return hidden()\n")
+            subprocess.run(["git","init","-q",str(root)],check=True)
+            subprocess.run(["git","-C",str(root),"-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                "add","."],check=True)
+            subprocess.run(["git","-C",str(root),"-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                "commit","-qm","tracked private fixture"],check=True)
+            state=Path(td)/"shared-state"
+            # Simulate an older consumer having populated an unfiltered cache.
+            SourceIndex(Repository(root,"fixture",state)).update()
+            restricted=SourceIndex(Repository(root,"fixture",state,deny_patterns=(".env", "hidden.py")))
+            self.assertEqual(restricted.tree()["paths"],["public.py"])
+            self.assertNotIn("tracked-secret",str(restricted.search("API_TOKEN")))
+            self.assertEqual(restricted.resolve("hidden")["matches"],[])
+            with self.assertRaises(FileNotFoundError): restricted.read(".env")
+            with self.assertRaises(FileNotFoundError): restricted.read("hidden.py")
+            with self.assertRaises(FileNotFoundError): restricted.structure("hidden.py")
+            with self.assertRaises(FileNotFoundError): restricted.history("hidden.py")
+            with self.assertRaises(FileNotFoundError): restricted.trace(["hidden.py"])
+            revision=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],check=True,
+                capture_output=True,text=True).stdout.strip()
+            historical=SourceIndex(Repository(root,"fixture",Path(td)/"historical",revision=revision,
+                deny_patterns=(".env", "hidden.py")))
+            with self.assertRaises(FileNotFoundError): historical.read(".env")
+            with self.assertRaises(FileNotFoundError): historical.context(["hidden.py"])
+            public=restricted.structure("public.py")
+            call=next(unit for unit in public.units if unit.kind=="call")
+            self.assertEqual(call.resolution,"unresolved")
+            self.assertNotIn("private",str(restricted.context(["public.py"],include=("implementation","callers","tests"))))
+
+    def test_cpp_provider_respects_consumer_deny_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)/"repo"; root.mkdir()
+            source=root/"private.cpp"; source.write_text("int secret_symbol();\n")
+            digest=hashlib.sha256(source.read_bytes()).hexdigest()
+            export=Path(td)/"export.json"
+            export.write_text(json.dumps({"format":"CTXPP-EXPORT/1","root":str(root),
+                "index_integrity":True,"index_meta":{"semantic":True},
+                "records":[{"record":"file","path":"private.cpp","hash":digest},
+                    {"record":"symbol","id":"secret-id","name":"secret_symbol","file":"private.cpp","line":1,"definition":True}]}))
+            index=SourceIndex(Repository(root,"fixture",Path(td)/"state",deny_patterns=("private.cpp",)),
+                [CppContextCompilerProvider(export)])
+            with self.assertRaises(FileNotFoundError): index.structure("private.cpp")
+            provider=CppContextCompilerProvider(export)
+            result=provider.extract(index.repository,"private.cpp",source.read_bytes())
+            self.assertEqual(result.units,())
+            self.assertEqual(result.coverage,"unavailable")
+
     def test_deleted_files_leave_incremental_index_and_pinned_read_survives(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()

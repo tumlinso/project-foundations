@@ -26,6 +26,7 @@ class Repository:
     revision: str | None = None
     worktree_id: str | None = None
     exclude: tuple[str, ...] = (".git", ".ctxpp", "__pycache__", ".venv", "venv", "node_modules")
+    deny_patterns: tuple[str, ...] = ()
 
     def __post_init__(self):
         root = Path(self.root).expanduser().resolve()
@@ -39,6 +40,15 @@ class Repository:
     def identity(self) -> str:
         revision = self.revision or "working-tree"
         return f"{self.repository_id}@{revision}:{self.worktree_id or _worktree_id(self.root)}"
+
+    def includes(self, path: str) -> bool:
+        """Return whether a repository-relative path is visible under this view."""
+        normalized = PurePosixPath(path).as_posix()
+        parts = PurePosixPath(normalized).parts
+        if any(part in self.exclude for part in parts): return False
+        if normalized.startswith("./"): normalized = normalized[2:]
+        return not any(PurePosixPath(normalized).match(pattern) or fnmatch.fnmatchcase(normalized, pattern)
+                       for pattern in self.deny_patterns)
 
 
 @dataclass(frozen=True)
@@ -119,6 +129,9 @@ class CppContextCompilerProvider:
         self.export_path = Path(export_path).expanduser().resolve()
 
     def extract(self, repository: Repository, path: str, source_bytes: bytes) -> StructuralResult:
+        if not repository.includes(path):
+            return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
+                "unavailable", ("source path is excluded by repository policy",), self.name)
         try:
             envelope = json.loads(self.export_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -147,6 +160,9 @@ class CppContextCompilerProvider:
         symbols = [r for r in records if r.get("record") == "symbol" and r.get("file") == path]
         units: list[StructuralUnit] = []
         for record in symbols:
+            record_path = str(record.get("file", ""))
+            if not repository.includes(record_path):
+                continue
             line = int(record.get("line", 1)); end_line = int(record.get("end_line", line))
             units.append(StructuralUnit(str(record.get("name", "")),
                 "definition" if record.get("definition") else "declaration", path, line, end_line,
@@ -157,6 +173,9 @@ class CppContextCompilerProvider:
                     "symbol_id": record.get("id")}))
         edges = [r for r in records if r.get("record") == "edge" and r.get("file") == path]
         for edge in edges:
+            record_path = str(edge.get("file", ""))
+            if not repository.includes(record_path):
+                continue
             start_offset=int(edge.get("start",0)); end_offset=int(edge.get("end",start_offset))
             units.append(StructuralUnit(str(edge.get("type", "reference")), str(edge.get("type", "reference")),
                 path, int(edge.get("line",source_bytes[:start_offset].count(b"\n")+1)),
@@ -259,8 +278,7 @@ class SourceIndex:
         return full, rel
 
     def _included(self, rel: str) -> bool:
-        parts = PurePosixPath(rel).parts
-        return not any(part in self.repository.exclude for part in parts)
+        return self.repository.includes(rel)
 
     def _normalize_target(self, value: Any) -> dict[str, Any]:
         if isinstance(value, str):
@@ -331,6 +349,7 @@ class SourceIndex:
     def tree(self, path: str | None = None, limit: int = 200, cursor: str | None = None) -> dict[str, Any]:
         if not 1 <= limit <= 2000: raise ValueError("limit must be 1..2000")
         base, base_rel = self._path(path or ".")
+        if base_rel != "." and not self._included(base_rel): raise FileNotFoundError(base_rel)
         if self.repository.revision:
             output = _git(self.repository.root, "ls-tree", "-r", "--name-only", self.repository.revision)
             if output is None: raise ValueError(f"cannot list revision {self.repository.revision}")
@@ -376,6 +395,7 @@ class SourceIndex:
                 seen = set()
                 for value in candidates:
                     _, rel = self._path(value)
+                    if not self._included(rel): continue
                     try: data = subprocess.run(["git","-C",str(self.repository.root),"show",f"{self.repository.revision}:{rel}"],capture_output=True,timeout=5,check=True).stdout
                     except (OSError,subprocess.SubprocessError): continue
                     seen.add(rel)
@@ -467,6 +487,7 @@ class SourceIndex:
             rows = db.execute("SELECT path,sha256,text FROM files ORDER BY path").fetchall()
         matches=[]; needle=query.casefold()
         for row in rows:
+            if not self._included(row["path"]): continue
             for number,line in enumerate((row["text"] or "").splitlines(),1):
                 if needle in line.casefold():
                     matches.append({"path":row["path"],"line":number,"text":line[:1000],"sha256":row["sha256"],
@@ -490,6 +511,7 @@ class SourceIndex:
         matches=[]
         for row in rows:
             unit=json.loads(row["record"])
+            if not self._included(unit.get("path", "")): continue
             if unit.get("kind") not in wanted or query not in {unit.get("name"),unit.get("qualified_name"),unit.get("target")}:
                 continue
             unit["source"]=asdict(SourceRef(self.repository.repository_id,unit["path"],row["sha256"],
@@ -513,6 +535,7 @@ class SourceIndex:
 
     def structure(self, path: str, language: str | None = None) -> StructuralResult:
         _, rel = self._path(path)
+        if not self._included(rel): raise FileNotFoundError(rel)
         if not self.repository.revision:
             self.update([rel])
         if self.repository.revision:
@@ -528,6 +551,7 @@ class SourceIndex:
             units = self._parse_python(rel,data)
             with self._connect() as db:
                 definitions = [json.loads(row[0]) for row in db.execute("SELECT record FROM units")]
+            definitions = [item for item in definitions if self._included(item.get("path", ""))]
             by_name: dict[str, set[tuple[str,str,int]]] = {}
             for item in definitions:
                 if item.get("kind") == "definition":
@@ -563,7 +587,10 @@ class SourceIndex:
         if not 1 <= limit <= 500: raise ValueError("limit must be 1..500")
         args=["log","--date=iso-strict","--format=%H%x09%aI%x09%s"]
         if self.repository.revision: args += [self.repository.revision]
-        if path: args += ["--",self._path(path)[1]]
+        if path:
+            _, rel = self._path(path)
+            if not self._included(rel): raise FileNotFoundError(rel)
+            args += ["--",rel]
         output=_git(self.repository.root,*args)
         rows=[]
         if output:
@@ -578,6 +605,8 @@ class SourceIndex:
     def relationships(self, target: str | None = None, limit: int = 200) -> dict[str, Any]:
         """Read explicit project-context declarations; never infer them from mentions."""
         config=self.repository.root/".project-context.json"
+        if not self._included(".project-context.json"):
+            return {"relationships": [], "complete": False, "declarations": "excluded_by_policy"}
         if not config.is_file(): return {"relationships":[],"complete":True,"declarations":"not-configured"}
         try: payload=json.loads(config.read_text(encoding="utf-8"))
         except (OSError,json.JSONDecodeError) as exc:
@@ -607,6 +636,7 @@ class SourceIndex:
             rows=db.execute("SELECT units.record,files.sha256 FROM units JOIN files USING(path)").fetchall()
         for row in rows:
             unit=json.loads(row["record"])
+            if not self._included(unit.get("path", "")): continue
             if unit.get("kind")=="call":
                 edges.append({"source":unit["path"],"target":unit.get("target"),"predicate":"call",
                     "resolution":unit.get("resolution","unresolved"),"basis":"observed","line":unit.get("line"),
@@ -640,6 +670,7 @@ class SourceIndex:
         for target in starts:
             try:
                 _,path=self._path(target)
+                if not self._included(path): raise FileNotFoundError(path)
                 if (self.repository.root/path).exists():
                     start_nodes.add(path)
                     start_nodes.update(edge.get("source") for edge in edges if edge.get("source_path")==path)
@@ -668,12 +699,17 @@ class SourceIndex:
         sections: dict[str,tuple[Any,...]]={}; remaining=budget_bytes; omissions=[]
         continuations=[]; associations=[]
         original=[self._normalize_target(target) for target in targets]; requested=tuple(include)
+        for record in original:
+            explicit_path = record.get("path") or (record.get("target") if record.get("kind") in {"path", "file"} else None)
+            if explicit_path:
+                _, rel = self._path(explicit_path)
+                if not self._included(rel): raise FileNotFoundError(rel)
         revisions={record["revision"] for record in original if record.get("revision") is not None}
         if len(revisions)>1: raise ValueError("one context request can cover only one pinned revision; group targets by repository and revision")
         requested_revision=next(iter(revisions),self.repository.revision)
         if requested_revision!=self.repository.revision:
             pinned=Repository(self.repository.root,self.repository.repository_id,self.repository.state_dir,
-                requested_revision,self.repository.worktree_id,self.repository.exclude)
+                requested_revision,self.repository.worktree_id,self.repository.exclude,self.repository.deny_patterns)
             return SourceIndex(pinned,self.providers.values()).context(original,requested,budget_bytes,cursor)
         for record in original:
             if record.get("repository_id") not in {None,self.repository.repository_id}:
@@ -714,6 +750,7 @@ class SourceIndex:
             if path_candidate is None:
                 with self._connect() as db:
                     matches=[json.loads(r[0]) for r in db.execute("SELECT record FROM units")]
+                matches=[unit for unit in matches if self._included(unit.get("path", ""))]
                 definitions=[u for u in matches if u.get("kind") in {"definition","class"} and
                     target in {u.get("name"),u.get("qualified_name")} and
                     (target_record.get("path") is None or u.get("path")==target_record.get("path"))]
@@ -750,7 +787,8 @@ class SourceIndex:
             if any(name in requested for name in ("callers","references","tests")):
                 if indexed_units is None:
                     with self._connect() as db:
-                        indexed_units=[json.loads(r[0]) for r in db.execute("SELECT record FROM units")]
+                        indexed_units=[unit for r in db.execute("SELECT record FROM units")
+                            if self._included((unit:=json.loads(r[0])).get("path", ""))]
                 units=indexed_units
             else: units=[]
             target_names={target,target_name}

@@ -34,8 +34,12 @@ assessments or proof.
 
 ## `project_source` 0.1
 
-`Repository(root, repository_id, state_dir, revision=None, worktree_id=None)`
-is an explicit local source view. `SourceIndex(repository).update(paths=None)`
+`Repository(root, repository_id, state_dir, revision=None, worktree_id=None,
+exclude=..., deny_patterns=())` is an explicit local source view. A consuming
+application can pass its current deny patterns here; they are enforced across
+discovery, indexed and cached results, direct and historical reads, providers,
+traversal, and context assembly. The source package does not invent an
+application-specific deny policy. `SourceIndex(repository).update(paths=None)`
 indexes changed file content by digest in its private state directory.
 
 Core operations are `read(path, start_line=None, end_line=None, max_bytes=...,
