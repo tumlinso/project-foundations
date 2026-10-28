@@ -206,7 +206,7 @@ class ContextPacket:
     budget_bytes: int
     used_bytes: int
     complete: bool
-    omissions: tuple[str, ...] = ()
+    omissions: tuple[Any, ...] = ()
     cursor: str | None = None
     continuations: tuple[dict[str, Any], ...] = ()
     associations: tuple[dict[str, Any], ...] = ()
@@ -699,11 +699,18 @@ class SourceIndex:
         sections: dict[str,tuple[Any,...]]={}; remaining=budget_bytes; omissions=[]
         continuations=[]; associations=[]
         original=[self._normalize_target(target) for target in targets]; requested=tuple(include)
-        for record in original:
-            explicit_path = record.get("path") or (record.get("target") if record.get("kind") in {"path", "file"} else None)
-            if explicit_path:
-                _, rel = self._path(explicit_path)
-                if not self._included(rel): raise FileNotFoundError(rel)
+        denied_targets: dict[int, str] = {}
+        for index, record in enumerate(original):
+            candidate = record.get("path") or record.get("target")
+            if not candidate: continue
+            try:
+                _, rel = self._path(candidate)
+                is_path = bool(record.get("path")) or record.get("kind") in {"path", "file"} or \
+                    (record.get("kind") != "symbol" and
+                     ((self.repository.root / rel).is_file() or bool(self.repository.revision)))
+                if is_path and not self._included(rel): denied_targets[index] = rel
+            except ValueError:
+                continue
         revisions={record["revision"] for record in original if record.get("revision") is not None}
         if len(revisions)>1: raise ValueError("one context request can cover only one pinned revision; group targets by repository and revision")
         requested_revision=next(iter(revisions),self.repository.revision)
@@ -728,15 +735,24 @@ class SourceIndex:
                 target=record.get("path") or record.get("target")
                 try:
                     _,rel=self._path(target)
-                    data=(self.repository.root/rel).read_bytes()
-                    fingerprints.append(rel+":"+hashlib.sha256(data).hexdigest())
+                    if not self._included(rel):
+                        fingerprints.append(rel + ":denied")
+                    else:
+                        data=(self.repository.root/rel).read_bytes()
+                        fingerprints.append(rel+":"+hashlib.sha256(data).hexdigest())
                 except (ValueError,OSError): fingerprints.append(str(target)+":missing")
             generation="targets:"+hashlib.sha256("\n".join(fingerprints).encode()).hexdigest()
         scope=f"context:{self.repository.identity}:{json.dumps(original)}:{json.dumps(requested)}:{budget_bytes}:{generation}"
         start=_offset(cursor,scope); selected=original[start:]
         completed_targets=0
         indexed_units=None
-        for target_record in selected:
+        for selected_offset, target_record in enumerate(selected):
+            target_index = start + selected_offset
+            if target_index in denied_targets:
+                omissions.append({"reason": "path_denied", "target": target_record.get("target"),
+                    "path": denied_targets[target_index]})
+                completed_targets += 1
+                continue
             if remaining <= 0: omissions.append("budget exhausted before remaining targets"); break
             target=target_record.get("symbol") or target_record.get("path") or target_record["target"]
             path_candidate=None; symbol_definition=None; provider_partial=False

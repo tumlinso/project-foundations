@@ -90,11 +90,22 @@ class SourceTests(unittest.TestCase):
             historical=SourceIndex(Repository(root,"fixture",Path(td)/"historical",revision=revision,
                 deny_patterns=(".env", "hidden.py")))
             with self.assertRaises(FileNotFoundError): historical.read(".env")
-            with self.assertRaises(FileNotFoundError): historical.context(["hidden.py"])
+            denied_history_context=historical.context(["hidden.py"])
+            self.assertFalse(denied_history_context.complete)
+            self.assertEqual(denied_history_context.omissions[0]["reason"],"path_denied")
             public=restricted.structure("public.py")
             call=next(unit for unit in public.units if unit.kind=="call")
             self.assertEqual(call.resolution,"unresolved")
             self.assertNotIn("private",str(restricted.context(["public.py"],include=("implementation","callers","tests"))))
+            mixed=restricted.context(["public.py", ".env"],include=("implementation",),budget_bytes=1000)
+            self.assertFalse(mixed.complete)
+            self.assertIn("public",mixed.sections["implementation"][0].content)
+            self.assertTrue(any(isinstance(item,dict) and item.get("reason")=="path_denied"
+                for item in mixed.omissions))
+            denied_only=restricted.context([".env"],include=("implementation",),budget_bytes=1000)
+            self.assertFalse(denied_only.complete)
+            self.assertEqual(denied_only.sections,{})
+            self.assertEqual(denied_only.omissions[0]["reason"],"path_denied")
 
     def test_cpp_provider_respects_consumer_deny_policy(self):
         with tempfile.TemporaryDirectory() as td:

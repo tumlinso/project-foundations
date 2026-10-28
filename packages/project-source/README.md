@@ -18,6 +18,8 @@ apply their existing path policy uniformly to discovery, indexing, direct and
 historical reads, structural providers, graph traversal, and context assembly.
 The patterns use the same path matching rules as Project Control. Cached rows
 from an older or less restrictive consumer remain filtered at query time.
+In a context bundle, excluded targets are reported as `path_denied` omissions;
+other requested targets still return their available context.
 
 Python definitions, imports and locally resolvable calls are structural
 observations. Unresolved or ambiguous calls remain labeled as such. Other
