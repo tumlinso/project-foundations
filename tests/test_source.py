@@ -139,6 +139,37 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(result.units,())
             self.assertEqual(result.coverage,"unavailable")
 
+    def test_cpp_provider_omits_explicitly_nonsemantic_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)/"repo"; root.mkdir()
+            source=root/"plan.cpp"; source.write_text("void plan(){ good(); guessed(); token(); }\n")
+            digest=hashlib.sha256(source.read_bytes()).hexdigest()
+            records=[{"record":"file","path":"plan.cpp","hash":digest},
+                {"record":"symbol","id":"good-id","name":"good","file":"plan.cpp","line":1,"definition":True},
+                {"record":"symbol","id":"guess-id","name":"guessed","file":"plan.cpp","line":1,"definition":True,"degraded":True},
+                {"record":"symbol","id":"token-id","name":"token","file":"plan.cpp","line":1,"definition":True,"semantic_origin":"lexical_candidate"},
+                {"record":"edge","type":"call","from":"caller","to":"good-id","file":"plan.cpp","start":18,"end":22,"semantic":True},
+                {"record":"edge","type":"call","from":"caller","to":"guess-id","file":"plan.cpp","start":27,"end":34,"semantic":False},
+                {"record":"edge","type":"call","from":"caller","to":"token-id","file":"plan.cpp","start":37,"end":42,"degraded":True}]
+            export=Path(td)/"export.json"
+            export.write_text(json.dumps({"format":"CTXPP-EXPORT/1","root":str(root),
+                "index_integrity":True,"index_meta":{"semantic":True,"incomplete":False},
+                "records":records}))
+            index=SourceIndex(Repository(root,"fixture",Path(td)/"state"),[CppContextCompilerProvider(export)])
+            structural=index.structure("plan.cpp")
+            self.assertEqual({unit.name for unit in structural.units},{"good","call"})
+            self.assertEqual(structural.coverage,"partial")
+            self.assertTrue(any("records degraded or nonsemantic" in item for item in structural.diagnostics))
+
+            lexical=json.loads(export.read_text())
+            lexical["index_meta"]["semantic"]=False
+            export.write_text(json.dumps(lexical))
+            rejected=index.structure("plan.cpp")
+            self.assertEqual(rejected.units,())
+            self.assertEqual(rejected.coverage,"partial")
+            self.assertTrue(any("semantic=false" in item for item in rejected.diagnostics))
+            self.assertEqual(index.search("guessed")["total"],1)
+
     def test_deleted_files_leave_incremental_index_and_pinned_read_survives(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()

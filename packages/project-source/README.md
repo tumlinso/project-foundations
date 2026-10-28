@@ -26,4 +26,6 @@ do not trigger a project-wide structural index refresh.
 Python definitions, imports and locally resolvable calls are structural
 observations. Unresolved or ambiguous calls remain labeled as such. Other
 languages have file and lexical search unless a structural provider is added.
+C++ export records explicitly marked lexical or degraded are omitted from
+structural results, which report partial coverage; text search remains lexical.
 See [the shared API contract](../../docs/API.md).

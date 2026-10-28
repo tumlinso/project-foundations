@@ -157,11 +157,22 @@ class CppContextCompilerProvider:
         if indexed and indexed.get("hash") not in {None, digest}:
             return StructuralResult(path, digest, (), "stale",
                 ("exported C++ file hash differs from current source",), self.name)
+        meta = envelope.get("index_meta", {})
+        if meta.get("semantic") is False:
+            diagnostics = ["producer index declares semantic=false; lexical/degraded records were omitted"]
+            if meta.get("incomplete"):
+                diagnostics.append("producer index reports incomplete overall coverage")
+            return StructuralResult(path, digest, (), "partial", tuple(diagnostics), self.name)
         symbols = [r for r in records if r.get("record") == "symbol" and r.get("file") == path]
         units: list[StructuralUnit] = []
+        omitted_nonsemantic = False
         for record in symbols:
             record_path = str(record.get("file", ""))
             if not repository.includes(record_path):
+                continue
+            semantic_origin = str(record.get("semantic_origin", "")).casefold().replace("_", "-")
+            if record.get("degraded") is True or record.get("semantic") is False or semantic_origin.startswith("lexical"):
+                omitted_nonsemantic = True
                 continue
             line = int(record.get("line", 1)); end_line = int(record.get("end_line", line))
             units.append(StructuralUnit(str(record.get("name", "")),
@@ -176,6 +187,10 @@ class CppContextCompilerProvider:
             record_path = str(edge.get("file", ""))
             if not repository.includes(record_path):
                 continue
+            semantic_origin = str(edge.get("semantic_origin", "")).casefold().replace("_", "-")
+            if edge.get("degraded") is True or edge.get("semantic") is False or semantic_origin.startswith("lexical"):
+                omitted_nonsemantic = True
+                continue
             start_offset=int(edge.get("start",0)); end_offset=int(edge.get("end",start_offset))
             units.append(StructuralUnit(str(edge.get("type", "reference")), str(edge.get("type", "reference")),
                 path, int(edge.get("line",source_bytes[:start_offset].count(b"\n")+1)),
@@ -188,10 +203,9 @@ class CppContextCompilerProvider:
         status = freshness.get("status", freshness.get("freshness", "unknown")) if isinstance(freshness, dict) else "unknown"
         if status == "unknown" and envelope.get("freshness_scope") == "as-recorded-at-index-time" and indexed.get("hash") == digest:
             status = "fresh-for-selected-source"
-        meta = envelope.get("index_meta", {})
         diagnostics = [] if status in {"fresh", "current", "ok", "fresh-for-selected-source"} else [f"producer freshness status: {status}"]
-        if meta.get("semantic") is False:
-            diagnostics.append("producer index is lexical/degraded, not fully semantic")
+        if omitted_nonsemantic:
+            diagnostics.append("producer marked records degraded or nonsemantic; those records were omitted")
         if indexed.get("parse_status") in {"error", "unobserved"}:
             diagnostics.append(f"file parse status: {indexed['parse_status']}")
         if meta.get("incomplete"):
