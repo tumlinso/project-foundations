@@ -91,6 +91,14 @@ class CppExportCacheTests(unittest.TestCase):
         self.assertEqual(missing.coverage, "unavailable")
         self.assertEqual(missing.units, ())
 
+    def test_legacy_export_symlink_remains_supported(self):
+        link = self.base / "legacy-export-link.json"
+        link.symlink_to(self.export)
+        provider = CppContextCompilerProvider(link)
+        result = provider.extract(self.repository, "a.cpp", self.source)
+        self.assertEqual(result.coverage, "partial")
+        self.assertEqual([unit.name for unit in result.units], ["a", "call"])
+
     def test_source_edit_still_reports_stale(self):
         self.assertEqual(self._extract().coverage, "partial")
         edited = b"int a();\nint b();\n// changed\n"

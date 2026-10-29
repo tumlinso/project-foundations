@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Mapping, Protocol
 
 from project_evidence import SourceRef
+from . import cpp_artifact_v2
 
 
 @lru_cache(maxsize=16_384)
@@ -140,7 +141,8 @@ class CppContextCompilerProvider:
     name = "cpp-context-compiler"
 
     def __init__(self, export_path: str | Path):
-        self.export_path = Path(export_path).expanduser().resolve()
+        self._export_input = Path(export_path).expanduser()
+        self.export_path = self._export_input.resolve()
         self._cache_lock = threading.Lock()
         self._cache_identity: tuple[int, int, int, int, int] | None = None
         self._cache: tuple[dict[str, Any], dict[str, dict[str, Any]],
@@ -154,8 +156,18 @@ class CppContextCompilerProvider:
                     before = self.export_path.stat()
                     identity = (before.st_dev, before.st_ino, before.st_size,
                                 before.st_mtime_ns, before.st_ctime_ns)
-                    if self._cache_identity == identity and self._cache is not None:
-                        return self._cache
+                    cached = self._cache
+                    if (self._export_input.is_symlink() and cached is not None
+                            and cached[0].get("format") == cpp_artifact_v2.FORMAT):
+                        raise ValueError("ctxpp v2 descriptor must not be a symbolic link")
+                    cache_identity = identity
+                    if cached is not None and cached[0].get("format") == cpp_artifact_v2.FORMAT:
+                        database_stat = cached[0]["database_path"].stat()
+                        cache_identity += (database_stat.st_dev, database_stat.st_ino,
+                                           database_stat.st_size, database_stat.st_mtime_ns,
+                                           database_stat.st_ctime_ns)
+                    if self._cache_identity == cache_identity and cached is not None:
+                        return cached
                     # Release the previous parsed tree before allocating its replacement.
                     self._cache_identity = None
                     self._cache = None
@@ -175,6 +187,30 @@ class CppContextCompilerProvider:
                     envelope = json.loads(payload)
                     if not isinstance(envelope, dict):
                         raise ValueError("export envelope must be an object")
+                    if envelope.get("format") == cpp_artifact_v2.FORMAT:
+                        if self._export_input.is_symlink():
+                            raise ValueError("ctxpp v2 descriptor must not be a symbolic link")
+                        envelope = cpp_artifact_v2.load_descriptor(self.export_path)
+                        # V2 records stay in SQLite; this cache contains only the
+                        # bounded descriptor and never materializes the graph.
+                        snapshot = (envelope, {}, {}, {})
+                        try:
+                            final = self.export_path.stat()
+                        except OSError:
+                            self._cache_identity = None
+                            self._cache = None
+                            raise
+                        final_identity = (final.st_dev, final.st_ino, final.st_size,
+                                          final.st_mtime_ns, final.st_ctime_ns)
+                        if final_identity != identity:
+                            self._cache_identity = None
+                            self._cache = None
+                            continue
+                        database_stat = envelope["database_path"].stat()
+                        cache_identity = identity + (database_stat.st_dev, database_stat.st_ino,
+                            database_stat.st_size, database_stat.st_mtime_ns, database_stat.st_ctime_ns)
+                        self._cache_identity, self._cache = cache_identity, snapshot
+                        return snapshot
                     records = envelope.get("records", [])
                     if not isinstance(records, list):
                         raise ValueError("export records must be a list")
@@ -235,6 +271,9 @@ class CppContextCompilerProvider:
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
                 "unavailable", (f"cannot read C++ export: {exc}",), self.name)
+        if envelope.get("format") == cpp_artifact_v2.FORMAT:
+            return self._extract_v2(repository, path, source_bytes, envelope,
+                                    include_units=include_units)
         if envelope.get("format") != "CTXPP-EXPORT/1":
             return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
                 "unsupported", ("unsupported cpp-context-compiler export format",), self.name)
@@ -321,6 +360,156 @@ class CppContextCompilerProvider:
             diagnostics.append("producer index reports incomplete overall coverage")
         coverage = "complete" if not diagnostics else "partial"
         return StructuralResult(path, digest, tuple(units), coverage, tuple(diagnostics), self.name)
+
+    def _extract_v2(self, repository: Repository, path: str, source_bytes: bytes,
+                    descriptor: dict[str, Any], *, include_units: bool) -> StructuralResult:
+        digest = hashlib.sha256(source_bytes).hexdigest()
+        if Path(descriptor["source_root"]) != repository.root:
+            return StructuralResult(path, digest, (), "mismatch",
+                ("export repository root does not match source repository",), self.name)
+        database = None
+        try:
+            database, metadata = cpp_artifact_v2.open_generation(descriptor)
+            indexed = cpp_artifact_v2.read_file(database, path)
+            if indexed is None:
+                return StructuralResult(path, digest, (), "unavailable",
+                    ("file is absent from the exported C++ index",), self.name)
+            if indexed.get("hash") not in {None, digest}:
+                return StructuralResult(path, digest, (), "stale",
+                    ("exported C++ file hash differs from current source",), self.name)
+            meta = metadata.get("index_meta", {})
+            if not isinstance(meta, dict):
+                raise cpp_artifact_v2.CtxppArtifactError("ctxpp index metadata is invalid")
+            if meta.get("semantic") is False:
+                diagnostics = ["producer index declares semantic=false; lexical/degraded records were omitted"]
+                if meta.get("incomplete"):
+                    diagnostics.append("producer index reports incomplete overall coverage")
+                return StructuralResult(path, digest, (), "partial", tuple(diagnostics), self.name)
+            symbols = cpp_artifact_v2.read_symbols(database, path)
+            edges = cpp_artifact_v2.read_edges(database, path)
+            units: list[StructuralUnit] = []
+            omitted_nonsemantic = False
+            for record in symbols:
+                record_path = str(record.get("file", ""))
+                if not repository.includes(record_path):
+                    continue
+                semantic_origin = str(record.get("semantic_origin", "")).casefold().replace("_", "-")
+                if record.get("degraded") is True or record.get("semantic") is False or semantic_origin.startswith("lexical"):
+                    omitted_nonsemantic = True
+                    continue
+                if include_units:
+                    line = int(record.get("line", 1)); end_line = int(record.get("end_line", line))
+                    units.append(StructuralUnit(str(record.get("name", "")),
+                        "definition" if record.get("definition") else "declaration", path, line, end_line,
+                        deepcopy(record.get("qualified_name")), target=deepcopy(record.get("id")),
+                        resolution="resolved", basis="observed", provider=self.name,
+                        source_sha256=digest, metadata={"semantic_origin": deepcopy(record.get("semantic_origin")),
+                            "degraded": bool(record.get("degraded")), "representation_kind": deepcopy(record.get("representation_kind")),
+                            "symbol_id": deepcopy(record.get("id"))}))
+            newlines: list[int] | None = None
+            def line_at(offset: int) -> int:
+                nonlocal newlines
+                if newlines is None:
+                    newlines = [i for i, byte in enumerate(source_bytes) if byte == 10]
+                boundary = max(0, min(len(source_bytes), offset if offset >= 0 else len(source_bytes) + offset))
+                return bisect_right(newlines, boundary - 1) + 1
+            for edge in edges:
+                record_path = str(edge.get("file", ""))
+                if not repository.includes(record_path):
+                    continue
+                semantic_origin = str(edge.get("semantic_origin", "")).casefold().replace("_", "-")
+                if edge.get("degraded") is True or edge.get("semantic") is False or semantic_origin.startswith("lexical"):
+                    omitted_nonsemantic = True
+                    continue
+                if not include_units:
+                    continue
+                start_offset = int(edge.get("start", 0)); end_offset = int(edge.get("end", start_offset))
+                line = int(edge["line"]) if "line" in edge else line_at(start_offset)
+                end_line = int(edge["end_line"]) if "end_line" in edge else line_at(end_offset)
+                units.append(StructuralUnit(str(edge.get("type", "reference")), str(edge.get("type", "reference")),
+                    path, line, end_line, target=deepcopy(edge.get("to")),
+                    resolution="resolved" if edge.get("to") else "unresolved", basis="observed",
+                    provider=self.name, source_sha256=digest,
+                    metadata={"from": deepcopy(edge.get("from")), "type": deepcopy(edge.get("type")),
+                              "semantic": deepcopy(edge.get("semantic", True)), "edge": deepcopy(edge)}))
+            freshness = metadata.get("freshness", {})
+            file_freshness = freshness.get("files", {}).get(path, {}) if isinstance(freshness, dict) else {}
+            status = file_freshness.get("status", "unknown") if isinstance(file_freshness, dict) else "unknown"
+            if status == "unknown" and isinstance(file_freshness, dict) and file_freshness.get("hash") == digest:
+                status = "fresh-for-selected-source"
+            diagnostics = [] if status in {"fresh", "current", "ok", "fresh-for-selected-source"} else [f"producer freshness status: {status}"]
+            if omitted_nonsemantic:
+                diagnostics.append("producer marked records degraded or nonsemantic; those records were omitted")
+            if indexed.get("parse_status") in {"error", "unobserved"}:
+                diagnostics.append(f"file parse status: {indexed['parse_status']}")
+            if meta.get("incomplete"):
+                diagnostics.append("producer index reports incomplete overall coverage")
+            return StructuralResult(path, digest, tuple(units), "complete" if not diagnostics else "partial",
+                                    tuple(diagnostics), self.name)
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
+            return StructuralResult(path, digest, (), "unavailable",
+                (f"cannot read C++ export: {exc}",), self.name)
+        finally:
+            if database is not None:
+                database.close()
+
+    def _candidate_paths_v2(self, paths, descriptor, *, symbol=None, incoming=None,
+                            outgoing=None, predicates=()):
+        database = None
+        try:
+            if Path(descriptor["source_root"]).resolve() != Path(descriptor["root"]).resolve():
+                return paths
+            database, metadata = cpp_artifact_v2.open_generation(descriptor)
+            meta = metadata.get("index_meta", {})
+            if not isinstance(meta, dict) or meta.get("semantic") is False:
+                return paths
+            if symbol is not None:
+                rows = database.execute(
+                    "SELECT DISTINCT file FROM symbols WHERE id=? OR name=? OR qualified_name=?",
+                    (symbol, symbol, symbol)).fetchall()
+                selected = {row["file"] for row in rows}
+            else:
+                kinds = {"call", "reference", "type_use", "member_access", "include", "test_relationship"}
+                if predicates:
+                    kinds.intersection_update(predicates)
+                if not kinds:
+                    return []
+                type_rows = database.execute(
+                    "SELECT id FROM strings WHERE value IN (" + ",".join("?" for _ in kinds) + ")",
+                    tuple(sorted(kinds))).fetchall()
+                type_ids = [row["id"] for row in type_rows]
+                if not type_ids:
+                    return []
+                clauses = ["e.type_id IN (" + ",".join("?" for _ in type_ids) + ")"]
+                args: list[Any] = list(type_ids)
+                for column, values in (("e.to_id", incoming), ("e.from_id", outgoing)):
+                    if values is None:
+                        continue
+                    values = sorted({str(value) for value in values if value is not None})
+                    if not values:
+                        return []
+                    if len(values) > 500:
+                        values = values[:500]
+                    value_rows = database.execute(
+                        "SELECT id FROM strings WHERE value IN (" + ",".join("?" for _ in values) + ")",
+                        values).fetchall()
+                    node_ids = [row["id"] for row in value_rows]
+                    if not node_ids:
+                        return []
+                    clauses.append(column + " IN (" + ",".join("?" for _ in node_ids) + ")")
+                    args.extend(node_ids)
+                rows = database.execute(
+                    "SELECT DISTINCT f.value AS path FROM edges e JOIN strings f ON f.id=e.file_id WHERE "
+                    + " AND ".join(clauses), args).fetchall()
+                selected = {row["path"] for row in rows}
+            return [path for path in paths if path in selected]
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
+            # A query hint may reduce candidates only when the artifact is
+            # trustworthy. On errors, fall back to normal source inspection.
+            return paths
+        finally:
+            if database is not None:
+                database.close()
 
 
 @dataclass(frozen=True)
@@ -539,6 +728,12 @@ class SourceIndex:
         if query[1] is None:
             return []  # Never mix a newly available generation into this query.
         envelope, _files, symbols, edges = query[1]
+        if envelope.get("format") == cpp_artifact_v2.FORMAT:
+            if (Path(envelope["source_root"]).resolve() != self.repository.root
+                    or Path(envelope["root"]).resolve() != self.repository.root):
+                return paths
+            return query[0]._candidate_paths_v2(paths, envelope, symbol=symbol,
+                incoming=incoming, outgoing=outgoing, predicates=predicates)
         if (envelope.get("format") != "CTXPP-EXPORT/1" or envelope.get("index_integrity") is False
                 or Path(envelope.get("root", "")).resolve() != self.repository.root
                 or envelope.get("index_meta", {}).get("semantic") is False):

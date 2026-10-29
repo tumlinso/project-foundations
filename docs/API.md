@@ -89,3 +89,14 @@ service is required.
 The API is intentionally small and versioned at package level. This contract
 may gain optional fields before 1.0, but names and semantic distinctions above
 are the integration baseline.
+
+### C++ Context Compiler v2 artifacts
+
+`CppContextCompilerProvider` reads `CTXPP-EXPORT/1` JSON for compatibility and
+`CTXPP-EXPORT/2` descriptors for indexed C++ records. A v2 descriptor names a
+source root and a SQLite `CTXPP-INDEX/2` database relative to its declared
+state directory. The reader opens that database read-only, checks its schema,
+root, and generation, and retrieves only the requested source file's rows. It
+never invokes ctxpp or refreshes an index. Missing, stale, corrupt, or
+incompatible generations are returned as unavailable or partial source
+coverage.
