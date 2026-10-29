@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import ast
 import base64
+from bisect import bisect_right
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 import fnmatch
 import hashlib
@@ -12,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 import subprocess
+import threading
 from contextlib import contextmanager
 from typing import Any, Iterable, Mapping, Protocol
 
@@ -127,14 +130,98 @@ class CppContextCompilerProvider:
 
     def __init__(self, export_path: str | Path):
         self.export_path = Path(export_path).expanduser().resolve()
+        self._cache_lock = threading.Lock()
+        self._cache_identity: tuple[int, int, int, int, int] | None = None
+        self._cache: tuple[dict[str, Any], dict[str, dict[str, Any]],
+                           dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]] | None = None
+
+    def _load_export(self):
+        """Load one stable export generation and index its records by file."""
+        with self._cache_lock:
+            for _attempt in range(3):
+                try:
+                    before = self.export_path.stat()
+                    identity = (before.st_dev, before.st_ino, before.st_size,
+                                before.st_mtime_ns, before.st_ctime_ns)
+                    if self._cache_identity == identity and self._cache is not None:
+                        return self._cache
+                    # Release the previous parsed tree before allocating its replacement.
+                    self._cache_identity = None
+                    self._cache = None
+                    payload = self.export_path.read_bytes()
+                    after = self.export_path.stat()
+                except OSError:
+                    self._cache_identity = None
+                    self._cache = None
+                    raise
+                after_identity = (after.st_dev, after.st_ino, after.st_size,
+                                  after.st_mtime_ns, after.st_ctime_ns)
+                if identity != after_identity or len(payload) != after.st_size:
+                    self._cache_identity = None
+                    self._cache = None
+                    continue
+                try:
+                    envelope = json.loads(payload)
+                    if not isinstance(envelope, dict):
+                        raise ValueError("export envelope must be an object")
+                    records = envelope.get("records", [])
+                    if not isinstance(records, list):
+                        raise ValueError("export records must be a list")
+                    indexed: dict[str, dict[str, Any]] = {}
+                    symbols: dict[str, list[dict[str, Any]]] = {}
+                    edges: dict[str, list[dict[str, Any]]] = {}
+                    for record in records:
+                        if not isinstance(record, dict):
+                            continue
+                        kind = record.get("record")
+                        file = record.get("path", record.get("file")) if kind == "file" else record.get("file")
+                        if not isinstance(file, str):
+                            continue
+                        if kind == "file":
+                            indexed.setdefault(file, record)
+                        elif kind == "symbol":
+                            symbols.setdefault(file, []).append(record)
+                        elif kind == "edge":
+                            edges.setdefault(file, []).append(record)
+                    snapshot = (envelope, indexed, symbols, edges)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+                    self._cache_identity = None
+                    self._cache = None
+                    raise
+                # Verify that a replacement did not happen while indexing.
+                try:
+                    final = self.export_path.stat()
+                except OSError:
+                    self._cache_identity = None
+                    self._cache = None
+                    raise
+                final_identity = (final.st_dev, final.st_ino, final.st_size,
+                                  final.st_mtime_ns, final.st_ctime_ns)
+                if final_identity != identity:
+                    self._cache_identity = None
+                    self._cache = None
+                    continue
+                self._cache_identity, self._cache = identity, snapshot
+                return snapshot
+            self._cache_identity = None
+            self._cache = None
+            raise OSError("C++ export changed repeatedly while being read")
 
     def extract(self, repository: Repository, path: str, source_bytes: bytes) -> StructuralResult:
+        return self._extract(repository, path, source_bytes, include_units=True)
+
+    def _coverage(self, repository: Repository, path: str, source_bytes: bytes) -> StructuralResult:
+        """Validate one source against the export without constructing its units."""
+        return self._extract(repository, path, source_bytes, include_units=False)
+
+    def _extract(self, repository: Repository, path: str, source_bytes: bytes,
+                 *, include_units: bool) -> StructuralResult:
         if not repository.includes(path):
             return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
                 "unavailable", ("source path is excluded by repository policy",), self.name)
         try:
-            envelope = json.loads(self.export_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            envelope, indexed_records, symbol_records, edge_records = self._load_export()
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
                 "unavailable", (f"cannot read C++ export: {exc}",), self.name)
         if envelope.get("format") != "CTXPP-EXPORT/1":
@@ -148,9 +235,7 @@ class CppContextCompilerProvider:
             return StructuralResult(path, hashlib.sha256(source_bytes).hexdigest(), (),
                 "mismatch", ("export repository root does not match source repository",), self.name)
         digest = hashlib.sha256(source_bytes).hexdigest()
-        records = envelope.get("records", [])
-        indexed = next((r for r in records if r.get("record") == "file" and
-                        r.get("path", r.get("file")) == path), None)
+        indexed = indexed_records.get(path)
         if indexed is None:
             return StructuralResult(path, digest, (), "unavailable",
                 ("file is absent from the exported C++ index",), self.name)
@@ -163,7 +248,7 @@ class CppContextCompilerProvider:
             if meta.get("incomplete"):
                 diagnostics.append("producer index reports incomplete overall coverage")
             return StructuralResult(path, digest, (), "partial", tuple(diagnostics), self.name)
-        symbols = [r for r in records if r.get("record") == "symbol" and r.get("file") == path]
+        symbols = symbol_records.get(path, ())
         units: list[StructuralUnit] = []
         omitted_nonsemantic = False
         for record in symbols:
@@ -174,15 +259,25 @@ class CppContextCompilerProvider:
             if record.get("degraded") is True or record.get("semantic") is False or semantic_origin.startswith("lexical"):
                 omitted_nonsemantic = True
                 continue
+            if not include_units:
+                continue
             line = int(record.get("line", 1)); end_line = int(record.get("end_line", line))
             units.append(StructuralUnit(str(record.get("name", "")),
                 "definition" if record.get("definition") else "declaration", path, line, end_line,
-                record.get("qualified_name"), target=record.get("id"),
+                deepcopy(record.get("qualified_name")), target=deepcopy(record.get("id")),
                 resolution="resolved", basis="observed", provider=self.name,
-                source_sha256=digest, metadata={"semantic_origin": record.get("semantic_origin"),
-                    "degraded": bool(record.get("degraded")), "representation_kind": record.get("representation_kind"),
-                    "symbol_id": record.get("id")}))
-        edges = [r for r in records if r.get("record") == "edge" and r.get("file") == path]
+                source_sha256=digest, metadata={"semantic_origin": deepcopy(record.get("semantic_origin")),
+                    "degraded": bool(record.get("degraded")), "representation_kind": deepcopy(record.get("representation_kind")),
+                    "symbol_id": deepcopy(record.get("id"))}))
+        edges = edge_records.get(path, ())
+        newlines: list[int] | None = None
+        def line_at(offset: int) -> int:
+            nonlocal newlines
+            if newlines is None:
+                newlines = [i for i, byte in enumerate(source_bytes) if byte == 10]
+            # Match source_bytes[:offset], including Python's negative/clamped slices.
+            boundary = max(0, min(len(source_bytes), offset if offset >= 0 else len(source_bytes) + offset))
+            return bisect_right(newlines, boundary - 1) + 1
         for edge in edges:
             record_path = str(edge.get("file", ""))
             if not repository.includes(record_path):
@@ -191,14 +286,17 @@ class CppContextCompilerProvider:
             if edge.get("degraded") is True or edge.get("semantic") is False or semantic_origin.startswith("lexical"):
                 omitted_nonsemantic = True
                 continue
+            if not include_units:
+                continue
             start_offset=int(edge.get("start",0)); end_offset=int(edge.get("end",start_offset))
+            line = int(edge["line"]) if "line" in edge else line_at(start_offset)
+            end_line = int(edge["end_line"]) if "end_line" in edge else line_at(end_offset)
             units.append(StructuralUnit(str(edge.get("type", "reference")), str(edge.get("type", "reference")),
-                path, int(edge.get("line",source_bytes[:start_offset].count(b"\n")+1)),
-                int(edge.get("end_line",source_bytes[:end_offset].count(b"\n")+1)),
-                target=edge.get("to"), resolution="resolved" if edge.get("to") else "unresolved",
+                path, line, end_line,
+                target=deepcopy(edge.get("to")), resolution="resolved" if edge.get("to") else "unresolved",
                 basis="observed", provider=self.name, source_sha256=digest,
-                metadata={"from": edge.get("from"), "type": edge.get("type"),
-                          "semantic": edge.get("semantic", True), "edge": edge}))
+                metadata={"from": deepcopy(edge.get("from")), "type": deepcopy(edge.get("type")),
+                          "semantic": deepcopy(edge.get("semantic", True)), "edge": deepcopy(edge)}))
         freshness = envelope.get("freshness", {})
         status = freshness.get("status", freshness.get("freshness", "unknown")) if isinstance(freshness, dict) else "unknown"
         if status == "unknown" and envelope.get("freshness_scope") == "as-recorded-at-index-time" and indexed.get("hash") == digest:
@@ -396,6 +494,168 @@ class SourceIndex:
             cursor=page["cursor"]
             if cursor is None: return result
 
+    def _cpp_query(self):
+        """Capture one provider generation for candidate routing, never source proof."""
+        provider = self.providers.get("cpp-context-compiler")
+        if not isinstance(provider, CppContextCompilerProvider):
+            return None
+        try:
+            snapshot = provider._load_export()
+        except (OSError, ValueError):
+            snapshot = None
+        return provider, snapshot
+
+    def _cpp_validate_query(self, query) -> None:
+        if query is None:
+            return
+        if query[1] is None:
+            try:
+                query[0]._load_export()
+            except (OSError, ValueError):
+                return
+            raise ValueError("C++ export changed during source query; retry")
+        try:
+            unchanged = query[0]._load_export() is query[1]
+        except (OSError, ValueError) as exc:
+            raise ValueError("C++ export changed during source query; retry") from exc
+        if not unchanged:
+            raise ValueError("C++ export changed during source query; retry")
+
+    def _cpp_candidate_paths(self, paths, query, *, symbol=None, incoming=None,
+                             outgoing=None, predicates=()):
+        if query is None:
+            return paths
+        if query[1] is None:
+            return []  # Never mix a newly available generation into this query.
+        envelope, _files, symbols, edges = query[1]
+        if (envelope.get("format") != "CTXPP-EXPORT/1" or envelope.get("index_integrity") is False
+                or Path(envelope.get("root", "")).resolve() != self.repository.root
+                or envelope.get("index_meta", {}).get("semantic") is False):
+            return paths
+        if symbol is not None:
+            selected = {path for path, records in symbols.items() if any(
+                symbol in (str(record.get("name", "")), record.get("qualified_name"), record.get("id"))
+                for record in records)}
+        else:
+            kinds = {"call", "reference", "type_use", "member_access", "include", "test_relationship"}
+            if predicates:
+                kinds.intersection_update(predicates)
+            selected = {path for path, records in edges.items() if any(
+                record.get("type", "reference") in kinds and (
+                    (incoming is not None and record.get("to") in incoming) or
+                    (outgoing is not None and record.get("from", path) in outgoing))
+                for record in records)}
+        return [path for path in paths if path in selected]
+
+    def _cpp_coverage_partial(self, paths, query, *, errors_partial=False) -> bool:
+        """Check all visible files without constructing unrelated structural units."""
+        if query is None:
+            return False
+        if query[1] is None:
+            return bool(paths)
+        provider = query[0]
+        for path in paths:
+            try:
+                full, rel = self._path(path)
+                if not self._included(rel):
+                    continue
+                if self.repository.revision:
+                    data = subprocess.run(["git", "-C", str(self.repository.root), "show",
+                        f"{self.repository.revision}:{rel}"], capture_output=True,
+                        timeout=5, check=True).stdout
+                else:
+                    data = full.read_bytes()
+                if provider._coverage(self.repository, rel, data).coverage != "complete":
+                    return True
+            except (OSError, ValueError, subprocess.SubprocessError):
+                if errors_partial:
+                    return True
+        return False
+
+    def _trace_start_nodes(self, starts, edges, symbol_nodes):
+        start_nodes = set()
+        for target in starts:
+            try:
+                _, path = self._path(target)
+                if not self._included(path):
+                    raise FileNotFoundError(path)
+                if (self.repository.root / path).exists():
+                    start_nodes.add(path)
+                    start_nodes.update(edge.get("source") for edge in edges if edge.get("source_path") == path)
+                else:
+                    start_nodes.add(target)
+            except ValueError:
+                start_nodes.add(target)
+            start_nodes.update(node for node in symbol_nodes.get(target, set()) if node)
+        return start_nodes
+
+    def _cpp_trace_results(self, paths, query, starts, predicates, direction, max_hops, python_edges):
+        """Discover relevant files through hints, validating every used edge normally."""
+        if query is not None and query[1] is None:
+            return [], bool(paths)
+        results = {}
+        symbol_nodes = {}
+        observations = []
+        partial = self._cpp_coverage_partial(paths, query, errors_partial=True)
+        kinds = {"call", "reference", "type_use", "member_access", "include", "test_relationship"}
+        if predicates:
+            kinds.intersection_update(predicates)
+
+        def load(candidates):
+            nonlocal partial
+            for path in candidates:
+                if path in results:
+                    continue
+                try:
+                    result = self.structure(path)
+                except (OSError, ValueError):
+                    partial = True
+                    results[path] = None
+                    continue
+                results[path] = result
+                partial |= result.coverage != "complete"
+                for unit in result.units:
+                    if unit.kind in {"definition", "declaration", "class"}:
+                        for name in (unit.name, unit.qualified_name, unit.metadata.get("symbol_id")):
+                            if name:
+                                symbol_nodes.setdefault(name, set()).add(unit.metadata.get("symbol_id"))
+                    if unit.kind in kinds:
+                        edge = unit.metadata.get("edge", {})
+                        observations.append({"source": edge.get("from", path), "target": edge.get("to"),
+                            "predicate": unit.kind, "source_path": path})
+
+        initial = set()
+        for target in starts:
+            initial.update(self._cpp_candidate_paths(paths, query, symbol=target))
+            try:
+                _, path = self._path(target)
+                if path in paths:
+                    initial.add(path)
+            except ValueError:
+                pass
+        load(path for path in paths if path in initial)
+        base = [edge for edge in python_edges if not predicates or edge["predicate"] in predicates]
+        frontier = self._trace_start_nodes(starts, [*base, *observations], symbol_nodes)
+        seen = set(frontier)
+        for _ in range(max_hops):
+            load(self._cpp_candidate_paths(paths, query,
+                incoming=frontier if direction in {"in", "both"} else None,
+                outgoing=frontier if direction in {"out", "both"} else None,
+                predicates=predicates))
+            following = set()
+            for edge in [*base, *observations]:
+                forward = edge.get("source") in frontier and direction in {"out", "both"}
+                backward = edge.get("target") in frontier and direction in {"in", "both"}
+                if forward or backward:
+                    node = edge.get("target") if forward else edge.get("source")
+                    if node is not None and node not in seen:
+                        following.add(node)
+            seen.update(following)
+            frontier = following
+            if not frontier:
+                break
+        return [(path, results[path]) for path in paths if results.get(path) is not None], partial
+
     def update(self, paths: Iterable[str] | None = None) -> dict[str, int]:
         changed = removed = unchanged = 0
         full_scan = paths is None
@@ -532,8 +792,11 @@ class SourceIndex:
                 self.repository.revision,self.repository.worktree_id or _worktree_id(self.repository.root),
                 unit.get("line"),unit.get("end_line")))
             matches.append(unit)
+        cpp_query = None
         if any(p.name=="cpp-context-compiler" for p in self.providers.values()):
-            for path in self._all_tree_paths():
+            cpp_query = self._cpp_query()
+            paths = self._all_tree_paths()
+            for path in self._cpp_candidate_paths(paths, cpp_query, symbol=query):
                 if Path(path).suffix.lower() not in {".cc",".cpp",".cxx",".c",".hh",".hpp",".hxx",".h"}: continue
                 try: result=self.structure(path)
                 except (OSError,ValueError): continue
@@ -543,6 +806,7 @@ class SourceIndex:
                     matches.append({**asdict(item),"source":asdict(SourceRef(self.repository.repository_id,path,
                         result.sha256,self.repository.revision,self.repository.worktree_id or _worktree_id(self.repository.root),
                         item.line,item.end_line))})
+        self._cpp_validate_query(cpp_query)
         resolution="unresolved" if not matches else "resolved" if len(matches)==1 else "ambiguous"
         return {"query":query,"resolution":resolution,"matches":matches[:limit],
                 "complete":len(matches)<=limit,"total":len(matches)}
@@ -644,7 +908,7 @@ class SourceIndex:
               max_hops: int = 1, limit: int = 100) -> dict[str, Any]:
         if direction not in {"out","in","both"}: raise ValueError("direction must be out, in, or both")
         if not 0 <= max_hops <= 8 or not 1 <= limit <= 1000: raise ValueError("invalid traversal bound")
-        starts=list(targets); self.update()
+        starts=list(targets); predicates=tuple(predicates); self.update()
         edges=[]; coverage="complete"
         with self._connect() as db:
             rows=db.execute("SELECT units.record,files.sha256 FROM units JOIN files USING(path)").fetchall()
@@ -660,13 +924,15 @@ class SourceIndex:
                     "resolution":"declared","basis":"declared","line":unit.get("line"),
                     "provider":"python-ast","sha256":row["sha256"]})
         symbol_nodes={}
+        cpp_query = None
         if any(p.name=="cpp-context-compiler" for p in self.providers.values()):
             extensions={".cc",".cpp",".cxx",".c",".hh",".hpp",".hxx",".h"}
-            for path in self._all_tree_paths():
-                if Path(path).suffix.lower() not in extensions: continue
-                try: result=self.structure(path)
-                except (OSError,ValueError): coverage="partial"; continue
-                if result.coverage!="complete": coverage="partial"
+            paths = [path for path in self._all_tree_paths() if Path(path).suffix.lower() in extensions]
+            cpp_query = self._cpp_query()
+            results, partial = self._cpp_trace_results(paths, cpp_query, starts, predicates,
+                direction, max_hops, edges)
+            if partial: coverage="partial"
+            for path, result in results:
                 for unit in result.units:
                     if unit.kind in {"definition","declaration","class"}:
                         for name in (unit.name,unit.qualified_name,unit.metadata.get("symbol_id")):
@@ -680,17 +946,7 @@ class SourceIndex:
         if predicates: edges=[e for e in edges if e["predicate"] in set(predicates)]
         # Paths and exact symbol names/IDs are both accepted starts. Resolve names
         # to provider IDs where available, while retaining the caller's spelling.
-        start_nodes=set()
-        for target in starts:
-            try:
-                _,path=self._path(target)
-                if not self._included(path): raise FileNotFoundError(path)
-                if (self.repository.root/path).exists():
-                    start_nodes.add(path)
-                    start_nodes.update(edge.get("source") for edge in edges if edge.get("source_path")==path)
-                else: start_nodes.add(target)
-            except ValueError: start_nodes.add(target)
-            start_nodes.update(node for node in symbol_nodes.get(target, set()) if node)
+        start_nodes=self._trace_start_nodes(starts, edges, symbol_nodes)
         selected=[]; frontier=set(start_nodes); seen_nodes=set(frontier)
         for _ in range(max_hops):
             next_nodes=set()
@@ -703,6 +959,7 @@ class SourceIndex:
                     if node is not None and node not in seen_nodes: next_nodes.add(node)
             seen_nodes.update(next_nodes); frontier=next_nodes
             if not frontier: break
+        self._cpp_validate_query(cpp_query)
         return {"edges":selected[:limit],"complete":len(selected)<=limit and coverage=="complete",
                 "coverage":coverage,"visited":sorted(str(x) for x in seen_nodes),
                 "omissions":[] if coverage=="complete" else ["one or more structural providers were stale or unavailable"]}
@@ -793,6 +1050,7 @@ class SourceIndex:
                     path_candidate=rel
             except ValueError: pass
             target_name=str(target).rsplit(".",1)[0]
+            cpp_query = None
             if path_candidate is None:
                 with self._connect() as db:
                     matches=[json.loads(r[0]) for r in db.execute("SELECT record FROM units")]
@@ -801,7 +1059,11 @@ class SourceIndex:
                     target in {u.get("name"),u.get("qualified_name")} and
                     (target_record.get("path") is None or u.get("path")==target_record.get("path"))]
                 if any(p.name=="cpp-context-compiler" for p in self.providers.values()):
-                    for candidate_path in self._all_tree_paths():
+                    cpp_query = self._cpp_query()
+                    paths = [path for path in self._all_tree_paths() if Path(path).suffix.lower() in
+                        {".cc",".cpp",".cxx",".c",".hh",".hpp",".hxx",".h"}]
+                    provider_partial |= self._cpp_coverage_partial(paths, cpp_query)
+                    for candidate_path in self._cpp_candidate_paths(paths, cpp_query, symbol=target):
                         if Path(candidate_path).suffix.lower() not in {".cc",".cpp",".cxx",".c",".hh",".hpp",".hxx",".h"}: continue
                         if target_record.get("path") and candidate_path!=target_record["path"]: continue
                         try: result=self.structure(candidate_path)
@@ -862,7 +1124,11 @@ class SourceIndex:
                     cpp_target or Path(path_candidate).suffix.lower() in cpp_extensions):
                 target_ids={cpp_target} if cpp_target else {u.metadata.get("symbol_id") for u in self.structure(path_candidate).units
                     if u.kind in {"definition","declaration","class"}}
-                for candidate_path in self._all_tree_paths():
+                if cpp_query is None:
+                    cpp_query = self._cpp_query()
+                paths = [path for path in self._all_tree_paths() if Path(path).suffix.lower() in cpp_extensions]
+                provider_partial |= self._cpp_coverage_partial(paths, cpp_query)
+                for candidate_path in self._cpp_candidate_paths(paths, cpp_query, incoming=target_ids):
                     if Path(candidate_path).suffix.lower() not in cpp_extensions: continue
                     try: result=self.structure(candidate_path)
                     except (OSError,ValueError): continue
@@ -871,6 +1137,7 @@ class SourceIndex:
                         edge=unit.metadata.get("edge",{})
                         if unit.kind in {"call","reference","type_use","member_access","test_relationship"} and edge.get("to") in target_ids:
                             cpp_matches.append((candidate_path,unit))
+            self._cpp_validate_query(cpp_query)
             callers=[]; references=[]; cpp_tests=[]
             for unit in matching:
                 associations.append({"target":target,"relation":"call","resolution":unit.get("resolution","candidate"),
