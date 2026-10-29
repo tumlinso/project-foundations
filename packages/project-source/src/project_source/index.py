@@ -6,6 +6,7 @@ import base64
 from bisect import bisect_right
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 import fnmatch
 import hashlib
 import json
@@ -19,6 +20,20 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Mapping, Protocol
 
 from project_evidence import SourceRef
+
+
+@lru_cache(maxsize=16_384)
+def _cached_repository_path_included(normalized: str, exclude: tuple[str, ...],
+                                    deny_patterns: tuple[str, ...]) -> bool:
+    """Pure path-policy predicate; filesystem and actor state are not cached."""
+    pure_path = PurePosixPath(normalized)
+    parts = pure_path.parts
+    if any(part in exclude for part in parts):
+        return False
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return not any(pure_path.match(pattern) or fnmatch.fnmatchcase(normalized, pattern)
+                   for pattern in deny_patterns)
 
 
 @dataclass(frozen=True)
@@ -47,11 +62,7 @@ class Repository:
     def includes(self, path: str) -> bool:
         """Return whether a repository-relative path is visible under this view."""
         normalized = PurePosixPath(path).as_posix()
-        parts = PurePosixPath(normalized).parts
-        if any(part in self.exclude for part in parts): return False
-        if normalized.startswith("./"): normalized = normalized[2:]
-        return not any(PurePosixPath(normalized).match(pattern) or fnmatch.fnmatchcase(normalized, pattern)
-                       for pattern in self.deny_patterns)
+        return _cached_repository_path_included(normalized, tuple(self.exclude), tuple(self.deny_patterns))
 
 
 @dataclass(frozen=True)
@@ -458,8 +469,7 @@ class SourceIndex:
                             () if complete else (f"content truncated at {max_bytes} bytes",),
                             None if complete else _cursor(next_offset,scope))
 
-    def tree(self, path: str | None = None, limit: int = 200, cursor: str | None = None) -> dict[str, Any]:
-        if not 1 <= limit <= 2000: raise ValueError("limit must be 1..2000")
+    def _tree_inventory(self, path: str | None = None) -> tuple[str, list[str]]:
         base, base_rel = self._path(path or ".")
         if base_rel != "." and not self._included(base_rel): raise FileNotFoundError(base_rel)
         if self.repository.revision:
@@ -481,18 +491,19 @@ class SourceIndex:
                         full = Path(root) / name
                         rel = full.relative_to(self.repository.root).as_posix()
                         if self._included(rel): items.append(rel)
-        items.sort(); scope="tree:"+base_rel+":"+hashlib.sha256("\n".join(items).encode()).hexdigest()
+        items.sort()
+        return base_rel, items
+
+    def tree(self, path: str | None = None, limit: int = 200, cursor: str | None = None) -> dict[str, Any]:
+        if not 1 <= limit <= 2000: raise ValueError("limit must be 1..2000")
+        base_rel, items = self._tree_inventory(path)
+        scope="tree:"+base_rel+":"+hashlib.sha256("\n".join(items).encode()).hexdigest()
         start = _offset(cursor,scope); page = items[start:start + limit]
         return {"paths": page, "complete": start + len(page) >= len(items),
                 "total": len(items), "cursor": _cursor(start + limit,scope) if start + limit < len(items) else None}
 
     def _all_tree_paths(self) -> list[str]:
-        result=[]; cursor=None
-        while True:
-            page=self.tree(limit=2000,cursor=cursor)
-            result.extend(page["paths"])
-            cursor=page["cursor"]
-            if cursor is None: return result
+        return self._tree_inventory()[1]
 
     def _cpp_query(self):
         """Capture one provider generation for candidate routing, never source proof."""
